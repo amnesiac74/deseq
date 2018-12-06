@@ -1,0 +1,194 @@
+#source("https://bioconductor.org/biocLite.R")
+#biocLite("DESeq2")
+#biocLite("biomaRt")
+library(DESeq2)
+library(ggplot2)
+library(ggrepel)
+library(ggalt)
+
+# prepare countdata (eg. condition left vs right)
+countData<-as.matrix(counts.STAR.MOUSE, header=TRUE, row.names=1) 
+colData <-data.frame(row.names=colnames(countData), condition=factor(c("left","left","left","right","right","right")))
+
+
+#tsne dimension reduction to visualize sample clustering
+library(Rtsne)
+mat <-log10(as.matrix(countData)+1)
+colnames(mat) <- c('left','left','left','left','left','right','right','right','right','right','pit','pit','pit','pit','pit','meso','meso','meso','meso','meso')
+d <-dist(t(mat))
+set.seed(0)
+tsne_out <- Rtsne(d, is_distance=TRUE, perplexity=2, verbose = TRUE)  #change perplexity if error
+#plot(tsne_out$Y, col=colData$condition, pch=16, main='tSNE')
+#text(tsne_out$Y, labels = colnames(mat), pos = 3)
+
+ggdata <- as.data.frame(tsne_out)
+ggtsne <- ggplot(ggdata, aes(Y.1, Y.2)) +
+  labs(x= "tsne dim1", y= "tsne dim2") +
+  theme_bw()+
+  theme(legend.position = c(0.07,0.92), legend.background = element_blank())+
+  theme(legend.title = element_blank())+
+  geom_point(aes(col=colData$condition))+
+  geom_encircle(data=subset(ggdata, colData$condition=="left"), s_shape =0.5, expand=0.05, col='red')+
+  geom_encircle(data=subset(ggdata, colData$condition=="right"), s_shape =0.5, expand=0.05, col='purple')
+ggtsne
+
+
+#PCA (alternative)
+base.pca <-prcomp (t(mat))
+plot(base.pca$x[,1], base.pca$x[,2], col=colData$condition, pch=16, main='PCA')
+text(base.pca$x[ ,1], base.pca$x[ ,2], labels = colnames(mat))
+
+
+#deseq
+dds <-DESeqDataSetFromMatrix(countData, colData, design=~condition)
+dds <-DESeq(dds)
+
+res <-results(dds,contrast = c("condition","left","right"))
+res
+
+
+#ANNOTATING gene names with biomart
+
+library("biomaRt")
+#listMarts()
+#searchDatasets()
+#saerchAttributes()
+#searchFilters()
+
+res$ensembl <- sapply( strsplit( rownames(res_pitcrown), split="\\+" ), "[", 1 )
+ensembl = useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+genemap <- getBM( attributes = c("ensembl_gene_id", "entrezgene","mgi_symbol"),
+                  filters = "ensembl_gene_id",
+                  values = res$ensembl,
+                  mart = ensembl )
+idx <- match( res$ensembl, genemap$ensembl_gene_id )
+res$entrez <- genemap$entrezgene[ idx ]
+res$mgi_symbol <-genemap$mgi_symbol[ idx ]
+head(res)
+
+#exporting results
+write.csv( as.data.frame(res), file="results.csv")
+
+
+
+#MA plot
+plotMA(dds)
+plotMA(res, ylim = c(-1,1))
+barplot(colSums(countData)*1e-6,names=colnames(countData),ylab = "library size (millions)")
+plotDispEsts(dds, ylim=c(1e-6, 1e1)) #plots black points as dispersion estimates for each gene
+hist( res$pvalue, breaks=20, col='grey') #histogram of pvalues
+
+#add aesthetics plotMA
+plotMA(dds, alpha=0.1, ylim=c(-10,10), main='MA plot FDR=0.5')
+abline(h=1, col="blue")
+abline(h=-1, col="blue")
+
+
+#volcanoplot
+library(calibrate)
+library(ggplot2)
+library(ggrepel)
+with(res, plot(log2FoldChange, -log10(pvalue), pch=20))
+with(subset(res, padj<0.05 ), points(log2FoldChange, -log10(pvalue), pch=20, col="red"))
+with(subset(res, abs(log2FoldChange)>1), points(log2FoldChange, -log10(pvalue), pch=20, col="orange"))
+vp <- with(subset(res, padj<.05 & abs(log2FoldChange)>1), points(log2FoldChange, -log10(pvalue), pch=20, col="dark red"))
+vp
+with(subset(res, padj<.05 & abs(log2FoldChange)>1.5), textxy(log2FoldChange, -log10(pvalue), labs=mgi_symbol, cex=.8))
+#p <-ggplot(vp, log2FoldChange, -log10(pvalue))
+
+
+
+#OR volcano plot
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+
+res1 <-as.data.frame(res_pitcrown)
+res1 <-mutate(res1, sig = ifelse(res1$padj<0.01, "FDR<0.01", "Not Sig"))
+ggv <- ggplot(res1, aes(log2FoldChange, -log10(padj)))+
+  geom_point(aes(col=sig))+
+  scale_color_manual(values = c('red','black'))
+ggvr <- ggv + geom_text_repel(data = filter(res1, padj<0.05 & baseMean > 10 & log2FoldChange>10 | log2FoldChange< -10), aes(label=mgi_symbol))
+#ggvr <- ggv + geom_label(data = filter(res1, padj<0.05 & baseMean > 10 & log2FoldChange>10 | log2FoldChange< -10), aes(label=mgi_symbol))
+ggvr
+
+
+
+
+
+
+
+#order by BH adjusted p-value
+resOrdered <-res[order(res$padj), ]
+head(resOrdered)
+
+#get diff exp gene matrix with FDR=10%, foldchange>1.5
+sig <- resOrdered[!is.na(resOrdered$padj)&
+                    resOrdered$padj<0.1 &
+                    abs(resOrdered$log2FoldChange)>=1.5, ]
+
+head(sig)
+dim(sig)
+
+
+
+#heatmap
+library( "gplots" )
+library( "RColorBrewer" )
+rld <-rlog(dds)
+head( assay(rld))
+par( mfrow = c(1,2))
+plot( log2( 1+counts(dds, normalized=TRUE)[, 1:2] ), col="#00000020", pch=20, cex=0.3 )
+plot( assay(rld)[, 1:2], col="#00000020", pch=20, cex=0.3 )
+
+sampleDists <- dist( t( assay(rld) ) )
+sampleDists
+
+sampleDistMatrix <- as.matrix( sampleDists )
+rownames(sampleDistMatrix) <- paste( rld$condition, rld$mgi_symbol, sep="-" )
+colnames(sampleDistMatrix) <- NULL
+
+colors = colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+heatmap.2( sampleDistMatrix, trace="none", col=colors)
+
+#heatmap of rld dds
+i <- head(assay(rld),100)
+j <-as.matrix(i)
+heatmap(j, margins = c(10,10), cexRow = .4)
+
+#heatmap
+#select genes
+selected <-rownames(sig);selected
+library("RColorBrewer")
+library("gplots")
+
+#colors of heatmap
+hmcol <-colorRampPalette(brewer.pal(9,"GnBu"))(100)
+heatmap.2(log2(counts(dds,normalized=TRUE)[rownames(dds)%in% selected,]),
+          col=hmcol, scale ="row",
+          Rowv = TRUE, Colv= FALSE,
+          dendogram ="row",
+          trace="none",
+          margin=c(4,6),cexRow=0.5, cexCol=1, keysize=1)
+
+
+#go analysis
+#universe
+universe <-rownames(resOrdered)
+
+#load mouse annotation and ID library
+#biocLite("org.Mm.eg.db")
+
+#convert gene names to Entrez ID
+genemap <-select(org.Mm.eg.db, selected, "ENTREZID", "SYMBOL")
+univmap <-select(org.Mm.eg.db, universe, "ENTREZID", "SYMBOL")
+
+#load GO scoring package
+biocLite("GOstats")
+library(GOStats)
+
+k <- kegga(fit, species="Hs") #Hs - homo sapiens, mouse mmu?
+k <- kegga(fit, species.KEGG="hsa") # equivalent to previous
+topKEGG(k, sort = "up")
+topKEGG(k, sort = "down")
+
